@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  kafka-kraft:
+    image: confluentinc/cp-kafka:7.9.0
+    container_name: kafka-kraft
+    hostname: kafka-kraft
+    networks:
+      - kafka-network
+    ports:
+      - "9101:9101"
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT_EXTERNAL:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka-kraft:29092,PLAINTEXT_EXTERNAL://host.docker.internal:9092"
+      KAFKA_LISTENERS: "PLAINTEXT://kafka-kraft:29092,PLAINTEXT_EXTERNAL://0.0.0.0:9092,CONTROLLER://kafka-kraft:29093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka-kraft:29093"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+      CLUSTER_ID: "mRs5GWNUSmehOF71B9OjXQ"  # Replace with your generated ID
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  kafka-rest:
+    image: confluentinc/cp-kafka-rest:7.9.0
+    container_name: kafka-rest
+    hostname: kafka-rest
+    networks:
+      - kafka-network
+    ports:
+      - "8082:8082"
+    environment:
+      KAFKA_REST_HOST_NAME: kafka-rest
+      KAFKA_REST_BOOTSTRAP_SERVERS: "PLAINTEXT://kafka-kraft:29092,PLAINTEXT_EXTERNAL://host.docker.internal:9092"
+      KAFKA_REST_LISTENERS: "http://0.0.0.0:8082"
+    depends_on:
+      - kafka-kraft
+
+networks:
+  kafka-network:
+
+volumes:
+  kafka-data:
