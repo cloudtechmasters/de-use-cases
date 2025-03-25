@@ -55,7 +55,8 @@ fallback_schema = StructType([
 
 # 4. Parse JSON with error handling
 def parse_json(df, epoch_id):
-    if df.rdd.isEmpty():  # Correct way to check if DataFrame is empty
+    # Correct empty check for DataFrames
+    if df.count() == 0:
         return
     
     # Debug: Show incoming data
@@ -71,7 +72,7 @@ def parse_json(df, epoch_id):
     error_df = parsed_df.filter(F.col("parsed_data").isNull())
     
     # Process errors
-    if not error_df.rdd.isEmpty():  # Correct empty check
+    if error_df.count() > 0:
         print(f"\n=== Parse Errors in Batch {epoch_id} ===")
         error_df.show(truncate=False)
         error_df.write \
@@ -79,7 +80,7 @@ def parse_json(df, epoch_id):
             .parquet(error_path)
     
     # Process good records
-    if not good_df.rdd.isEmpty():  # Correct empty check
+    if good_df.count() > 0:
         final_df = good_df.select(
             "message_key",
             "kafka_timestamp",
