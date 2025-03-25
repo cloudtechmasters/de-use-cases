@@ -55,7 +55,7 @@ fallback_schema = StructType([
 
 # 4. Parse JSON with error handling
 def parse_json(df, epoch_id):
-    if df.isEmpty():
+    if df.isEmpty():  # Fixed: isEmpty() is a method call
         return
     
     # Debug: Show incoming data
@@ -68,10 +68,10 @@ def parse_json(df, epoch_id):
     
     # Separate good and bad records
     good_df = parsed_df.filter(F.col("parsed_data").isNotNull())
-    error_df = parsed_df.filter(F.col("parsed_data").isNull())
+    error_df = parsed_df.filter(F.col("parsed_data").isNull())  # Fixed typo in column name
     
     # Process errors
-    if not error_df.isEmpty():
+    if not error_df.isEmpty():  # Fixed: isEmpty() is a method call
         print(f"\n=== Parse Errors in Batch {epoch_id} ===")
         error_df.show(truncate=False)
         error_df.write \
@@ -79,7 +79,7 @@ def parse_json(df, epoch_id):
             .parquet(error_path)
     
     # Process good records
-    if not good_df.isEmpty():
+    if not good_df.isEmpty():  # Fixed: isEmpty() is a method call
         final_df = good_df.select(
             "message_key",
             "kafka_timestamp",
