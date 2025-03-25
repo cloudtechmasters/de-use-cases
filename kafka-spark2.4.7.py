@@ -1,5 +1,5 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json, lit
+from pyspark.sql import functions as F
 from pyspark.sql.types import StructType, StructField, StringType
 import os
 from os.path import expanduser
@@ -41,9 +41,9 @@ kafka_df = spark.readStream \
 
 # 2. Convert to JSON string with error handling
 json_string_df = kafka_df.select(
-    col("key").cast("string").alias("message_key"),
-    col("value").cast("string").alias("json_string"),
-    col("timestamp").alias("kafka_timestamp")
+    F.col("key").cast("string").alias("message_key"),
+    F.col("value").cast("string").alias("json_string"),
+    F.col("timestamp").alias("kafka_timestamp")
 )
 
 # 3. Define a fallback schema (modify according to your expected structure)
@@ -64,11 +64,11 @@ def parse_json(df, epoch_id):
     
     # Try parsing JSON
     parsed_df = df.withColumn("parsed_data", 
-                from_json(col("json_string"), fallback_schema))
+                F.from_json(F.col("json_string"), fallback_schema))
     
     # Separate good and bad records
-    good_df = parsed_df.filter(col("parsed_data").isNotNull())
-    error_df = parsed_df.filter(col("parsed_data").isNull())
+    good_df = parsed_df.filter(F.col("parsed_data").isNotNull())
+    error_df = parsed_df.filter(F.col("parsed_data").isNull())
     
     # Process errors
     if not error_df.isEmpty():
