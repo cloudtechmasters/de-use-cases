@@ -1,3 +1,12 @@
+#I just wanted to check—is there a limit to how many images we can send in one API call to check if lights are on? For example:
+
+Max images per request?
+
+Any rate limits (calls per minute/hour)?
+
+Does image size affect this?
+
+Just want to make sure we stay within the limits. Let me know—thanks!
 # de-use-cases
 
 # Kafka REST API Examples
