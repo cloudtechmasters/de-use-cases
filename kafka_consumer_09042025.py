@@ -1,28 +1,67 @@
-import json
-import os
-import logging
+# kafka_consumer_09042025.py
 import pyarrow as pa
 import pyarrow.parquet as pq
 from datetime import datetime
+import os
+import logging
+from typing import Dict, Any, Tuple, Optional
 from confluent_kafka import Consumer, KafkaError
-from kafka_config import load_and_validate_config  # Reuse the shared config loader
+import json
 import argparse
+import sys
 
 # Configuration
-OUTPUT_DIR = "../jewellery_data_09042025"  # Main folder for Parquet files
-KAFKA_GROUP_ID = "jewellery_consumer_group"
-MAX_FILE_SIZE_MB = 128  # Max size per Parquet file in MB
-DEFAULT_CONFIG_PATH = "client.properties"  # Default path to Kafka properties file
-DEFAULT_TOPIC = "jewelry-client-topic"  # Default Kafka topic
+DEFAULT_OUTPUT_DIR = "../jewellery_data_09042025"
+DEFAULT_CREDENTIALS_PATH = "client.properties"
+DEFAULT_TOPIC = "input_topic"
+MAX_FILE_SIZE_MB = 128
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("kafka_consumer.log")
+    ]
+)
+logger = logging.getLogger("KafkaConsumer")
 
-# Ensure output directory exists
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Kafka Consumer to Parquet")
+    parser.add_argument('--credentials', default=DEFAULT_CREDENTIALS_PATH,
+                       help="Path to client.properties file")
+    parser.add_argument('--topic', default=DEFAULT_TOPIC,
+                       help="Kafka topic to consume from")
+    parser.add_argument('--output-dir', default=DEFAULT_OUTPUT_DIR,
+                       help="Directory to store Parquet files")
+    parser.add_argument('--group-id', default='jewellery_consumer_group',
+                       help="Kafka consumer group ID")
+    return parser.parse_args()
 
+def load_kafka_config(credentials_path: str, group_id: str) -> Dict[str, str]:
+    config = {
+        'security.protocol': 'SASL_SSL',
+        'sasl.mechanism': 'PLAIN',
+        'group.id': group_id,
+        'auto.offset.reset': 'latest',
+        'enable.auto.commit': 'false',
+        'max.poll.interval.ms': '300000'
+    }
+    try:
+        with open(credentials_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    key, value = line.split('=', 1)
+                    config[key.strip()] = value.strip()
+        logger.info(f"Kafka config loaded from {credentials_path}, using bootstrap: {config.get('bootstrap.servers')}")
+        return config
+    except Exception as e:
+        logger.error(f"Failed to load config: {e}")
+        raise
 
-def infer_type(value):
-    """Recursively infer PyArrow type from a value, optimized for Spark."""
+def infer_type(value: Any) -> pa.DataType:
     if value is None:
         return pa.null()
     elif isinstance(value, bool):
@@ -33,194 +72,131 @@ def infer_type(value):
         return pa.float64()
     elif isinstance(value, str):
         try:
-            dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
-            return pa.timestamp('us') if 'T' in value else pa.date32()
-        except ValueError:
+            normalized = value.replace('Z', '+00:00')
+            datetime.fromisoformat(normalized)
+            return pa.timestamp('us')
+        except (ValueError, TypeError):
             return pa.string()
-    elif isinstance(value, list) and value:
-        return pa.list_(infer_type(value[0]))
-    elif isinstance(value, dict) and value:
-        key_type = infer_type(next(iter(value.keys())))
-        value_type = infer_type(next(iter(value.values())))
-        return pa.map_(key_type, value_type)
-    elif isinstance(value, list):
-        return pa.list_(pa.string())
     elif isinstance(value, dict):
-        return pa.map_(pa.string(), pa.string())
+        # Handle nested dictionaries (like 'specs')
+        fields = [pa.field(k, infer_type(v), nullable=True) for k, v in value.items()]
+        return pa.struct(fields)
     return pa.string()
 
+def infer_schema(record: Dict[str, Any]) -> pa.Schema:
+    fields = []
+    for key, value in record.items():
+        try:
+            field_type = infer_type(value)
+            fields.append(pa.field(key, field_type, nullable=True))
+        except Exception as e:
+            logger.warning(f"Failed to infer type for '{key}': {e}")
+            fields.append(pa.field(key, pa.string(), nullable=True))
+    return pa.schema(fields)
 
-def infer_schema_from_single(record):
-    """Infer schema from a single JSON record with nullable fields."""
-    field_types = {
-        key: pa.field(key, infer_type(value), nullable=True)
-        for key, value in record.items()
-    }
-    return pa.schema(list(field_types.values()))
-
-
-def load_existing_schema(directory):
-    """Load schema from the first Parquet file in the directory, if any exist."""
-    parquet_files = [f for f in os.listdir(directory) if f.endswith(".parquet")]
-    if parquet_files:
-        return pq.read_schema(os.path.join(directory, parquet_files[0]))
-    return None
-
-
-def merge_schemas(existing_schema, new_schema):
-    """Merge schemas for evolution, ensuring Spark compatibility."""
-    if not existing_schema:
-        return new_schema
-
-    merged_fields = {f.name: f for f in existing_schema}
-    for field in new_schema:
-        if field.name not in merged_fields:
-            merged_fields[field.name] = field
-        else:
-            current_type = merged_fields[field.name].type
-            new_type = field.type
-            if not pa.types.is_null(new_type) and not pa.types.is_null(current_type):
-                if pa.types.is_integer(current_type) and pa.types.is_floating(new_type):
-                    merged_fields[field.name] = pa.field(field.name, pa.float64(), nullable=True)
-                elif pa.types.is_timestamp(current_type) and pa.types.is_string(new_type):
-                    merged_fields[field.name] = pa.field(field.name, pa.timestamp('us'), nullable=True)
-                elif pa.types.is_string(current_type) or pa.types.is_string(new_type):
-                    merged_fields[field.name] = pa.field(field.name, pa.string(), nullable=True)
-
-    return pa.schema(list(merged_fields.values()))
-
-
-def convert_to_array(value, target_type):
-    """Convert a single value to a PyArrow array."""
+def convert_value(value: Any, target_type: pa.DataType):
     try:
         if value is None:
-            return pa.array([None], type=target_type)
+            return None
         if pa.types.is_timestamp(target_type) and isinstance(value, str):
-            dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
-            return pa.array([dt], type=pa.timestamp('us'))
-        elif pa.types.is_date(target_type) and isinstance(value, str):
-            dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
-            return pa.array([dt.date()], type=pa.date32())
-        elif pa.types.is_list(target_type):
-            return pa.array([value], type=target_type)
-        elif pa.types.is_map(target_type):
-            return pa.array([list(value.items())] if value else [None], type=target_type)
-        return pa.array([value], type=target_type)
+            return datetime.fromisoformat(value.replace('Z', '+00:00'))
+        elif pa.types.is_struct(target_type) and isinstance(value, dict):
+            return {k: convert_value(v, f.type) for k, f in zip(value.keys(), target_type)}
+        return value
     except Exception as e:
-        logging.warning(f"Failed to convert {value} to {target_type}: {e}")
-        return pa.array([str(value)], type=pa.string())
+        logger.warning(f"Conversion failed for {value}: {e}")
+        return str(value)
 
-
-def get_current_parquet_file(directory):
-    """Get the latest Parquet file and its index, or start a new one."""
-    parquet_files = sorted([f for f in os.listdir(directory) if f.endswith(".parquet")])
+def get_current_parquet_file(directory: str) -> str:
+    os.makedirs(directory, exist_ok=True)
+    parquet_files = [f for f in os.listdir(directory) if f.endswith(".parquet")]
     if not parquet_files:
-        return os.path.join(directory, "part-00001.parquet"), 1
+        return os.path.join(directory, "part-00001.parquet")
+    
+    latest_file = os.path.join(directory, sorted(parquet_files)[-1])
+    if os.path.getsize(latest_file) / (1024 * 1024) < MAX_FILE_SIZE_MB:
+        return latest_file
+    
+    index = len(parquet_files) + 1
+    return os.path.join(directory, f"part-{index:05d}.parquet")
 
-    latest_file = parquet_files[-1]  # e.g., "part-00003.parquet"
-    index = int(latest_file.split("-")[1].split(".")[0])  # Extract number (e.g., 3)
-
-    file_size_mb = os.path.getsize(os.path.join(directory, latest_file)) / (1024 * 1024)  # Size in MB
-    if file_size_mb < MAX_FILE_SIZE_MB:
-        return os.path.join(directory, latest_file), index
-    else:
-        new_index = index + 1
-        return os.path.join(directory, f"part-{new_index:05d}.parquet"), new_index
-
-
-def write_single_json_to_parquet(record, directory):
-    """Write a single JSON record to a Parquet file, splitting at 128 MB."""
-    new_schema = infer_schema_from_single(record)
-    existing_schema = load_existing_schema(directory)
-    schema = merge_schemas(existing_schema, new_schema)
-
-    # Create arrays for the new record
-    arrays = []
-    for field in schema:
-        value = record.get(field.name)
-        arrays.append(convert_to_array(value, field.type))
-    new_table = pa.Table.from_arrays(arrays, schema=schema)
-
-    # Determine the current file to write to
-    current_file, _ = get_current_parquet_file(directory)
-
-    # Append or write new
-    if os.path.exists(current_file):
-        existing_table = pq.read_table(current_file)
-        # Align existing table with merged schema
-        existing_arrays = []
+def write_to_parquet(records: list, directory: str):
+    try:
+        if not records:
+            return
+        
+        schema = infer_schema(records[0])
+        data = {}
         for field in schema:
-            if field.name in existing_table.schema.names:
-                existing_arrays.append(existing_table[field.name])
-            else:
-                existing_arrays.append(pa.array([None] * existing_table.num_rows, type=field.type))
-        aligned_existing_table = pa.Table.from_arrays(existing_arrays, schema=schema)
-
-        # Concatenate and write
-        combined = pa.concat_tables([aligned_existing_table, new_table])
+            data[field.name] = [convert_value(r.get(field.name), field.type) for r in records]
+        
+        table = pa.Table.from_pydict(data, schema=schema)
+        output_file = get_current_parquet_file(directory)
+        
+        # Use version '1.0' for maximum compatibility
         pq.write_table(
-            combined,
-            current_file,
-            row_group_size=100000,
-            compression='SNAPPY',
-            version='2.6',
-            flavor='spark'
+            table,
+            output_file,
+            version='1.0',
+            compression='snappy',
+            use_dictionary=True,
+            write_statistics=True
         )
-    else:
-        pq.write_table(
-            new_table,
-            current_file,
-            row_group_size=100000,
-            compression='SNAPPY',
-            version='2.6',
-            flavor='spark'
-        )
-    logging.info(f"Appended 1 record to {current_file}")
+        logger.info(f"Appended {len(records)} record(s) to {output_file}")
+    except Exception as e:
+        logger.error(f"Error writing to Parquet: {e}")
+        raise
 
+def create_consumer(credentials_path: str, group_id: str) -> Consumer:
+    try:
+        config = load_kafka_config(credentials_path, group_id)
+        return Consumer(config)
+    except Exception as e:
+        logger.error(f"Failed to create consumer: {e}")
+        raise
 
-def kafka_consumer_loop(config_path, topic_name):
-    """Consume JSON messages from Kafka and write to Parquet."""
-    conf = load_and_validate_config(config_path)  # Use the reusable config loader
-    conf["group.id"] = "jewellery_consumer_group"
-    conf["auto.offset.reset"] = "latest"
-
-    consumer = Consumer(conf)
-    consumer.subscribe([topic_name])
-
+def consume_messages(consumer: Consumer, topic: str, output_dir: str):
+    consumer.subscribe([topic])
+    batch = []
+    BATCH_SIZE = 100  # Process in batches for better performance
+    
     try:
         while True:
             msg = consumer.poll(1.0)
             if msg is None:
+                if batch:  # Write remaining batch
+                    write_to_parquet(batch, output_dir)
+                    batch.clear()
                 continue
+                
             if msg.error():
                 if msg.error().code() == KafkaError._PARTITION_EOF:
-                    logging.info("Reached end of partition")
+                    logger.debug("Reached end of partition")
                 else:
-                    logging.error(f"Kafka error: {msg.error()}")
+                    logger.error(f"Kafka error: {msg.error()}")
                 continue
-
+                
             try:
-                json_data = json.loads(msg.value().decode('utf-8'))
-                logging.info(f"Consumed message: {json_data}")
-                write_single_json_to_parquet(json_data, OUTPUT_DIR)
-            except json.JSONDecodeError as e:
-                logging.error(f"Failed to decode JSON: {e}")
+                record = json.loads(msg.value().decode('utf-8'))
+                logger.info(f"Consumed message: {record}")
+                batch.append(record)
+                
+                if len(batch) >= BATCH_SIZE:
+                    write_to_parquet(batch, output_dir)
+                    consumer.commit(asynchronous=False)
+                    batch.clear()
+                    
             except Exception as e:
-                logging.error(f"Error processing message: {e}")
-
+                logger.error(f"Error processing message: {e}")
+                
     except KeyboardInterrupt:
-        logging.info("Consumer interrupted by user")
+        if batch:
+            write_to_parquet(batch, output_dir)
+        logger.info("Shutting down...")
     finally:
         consumer.close()
-        logging.info("Kafka consumer closed")
-
 
 if __name__ == "__main__":
-    # Argument parser with config and topic options
-    parser = argparse.ArgumentParser(description="Kafka Consumer for Parquet")
-    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to Kafka .properties file")
-    parser.add_argument("--topic", default=DEFAULT_TOPIC, help="The Kafka topic to subscribe to")
-    args = parser.parse_args()
-
-    # Run the consumer loop with the provided config and topic
-    kafka_consumer_loop(args.config, args.topic)
+    args = parse_arguments()
+    consumer = create_consumer(args.credentials, args.group_id)
+    consume_messages(consumer, args.topic, args.output_dir)
